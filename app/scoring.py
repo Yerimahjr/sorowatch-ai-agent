@@ -80,8 +80,10 @@ def compute_volume_anomaly_score(operations: list[dict]) -> int:
         return 30 if largest > 0 else 0
 
     ratio = largest / median
+    if ratio <= 1:
+        return 0
     # ratio of 1 (uniform) -> 0 points; ratio of 20+ -> full 30 points.
-    return min(30, int((ratio / 20) * 30))
+    return min(30, int(((ratio - 1) / 19) * 30))
 
 
 def compute_risk_score(operations: list[dict]) -> int:
