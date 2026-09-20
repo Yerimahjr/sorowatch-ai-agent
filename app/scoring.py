@@ -1,0 +1,94 @@
+"""
+Risk scoring heuristics. Kept as pure functions (no I/O) so they're
+directly unit-testable without needing a live Horizon connection.
+"""
+from collections import Counter
+from datetime import datetime, timezone
+
+
+def _parse_time(op: dict) -> datetime | None:
+    ts = op.get("created_at")
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def compute_tx_velocity_score(operations: list[dict]) -> int:
+    """
+    Scores 0-40 based on how tightly clustered recent operations are in
+    time. Many operations in a short window is treated as more suspicious
+    than the same count spread over weeks.
+    """
+    times = sorted(t for t in (_parse_time(op) for op in operations) if t)
+    if len(times) < 2:
+        return 0
+
+    span_seconds = (times[-1] - times[0]).total_seconds()
+    if span_seconds <= 0:
+        span_seconds = 1
+
+    ops_per_hour = (len(times) / span_seconds) * 3600
+    # Cap the contribution at 40 points; scale linearly up to 20 ops/hour.
+    return min(40, int((ops_per_hour / 20) * 40))
+
+
+def compute_counterparty_diversity_score(operations: list[dict]) -> int:
+    """
+    Scores 0-30 based on counterparty concentration. Many operations with
+    very few distinct counterparties (a common laundering/wash-trading
+    pattern) scores higher than diverse, organic-looking activity.
+    """
+    counterparties = [
+        op.get("to") or op.get("from") or op.get("source_account")
+        for op in operations
+        if op.get("to") or op.get("from") or op.get("source_account")
+    ]
+    if not counterparties:
+        return 0
+
+    counts = Counter(counterparties)
+    top_share = counts.most_common(1)[0][1] / len(counterparties)
+    # top_share close to 1.0 (everything to/from one address) scores high.
+    return int(top_share * 30)
+
+
+def compute_volume_anomaly_score(operations: list[dict]) -> int:
+    """
+    Scores 0-30 based on payment volume variance. A few very large
+    payments among mostly small ones raises the score.
+    """
+    amounts = []
+    for op in operations:
+        raw = op.get("amount")
+        if raw is None:
+            continue
+        try:
+            amounts.append(float(raw))
+        except (TypeError, ValueError):
+            continue
+
+    if len(amounts) < 2:
+        return 0
+
+    amounts.sort()
+    median = amounts[len(amounts) // 2]
+    largest = amounts[-1]
+    if median <= 0:
+        return 30 if largest > 0 else 0
+
+    ratio = largest / median
+    # ratio of 1 (uniform) -> 0 points; ratio of 20+ -> full 30 points.
+    return min(30, int((ratio / 20) * 30))
+
+
+def compute_risk_score(operations: list[dict]) -> int:
+    """Combine the three heuristics into a single 0-100 score."""
+    score = (
+        compute_tx_velocity_score(operations)
+        + compute_counterparty_diversity_score(operations)
+        + compute_volume_anomaly_score(operations)
+    )
+    return max(0, min(100, score))
